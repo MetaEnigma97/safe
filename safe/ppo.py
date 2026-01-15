@@ -67,14 +67,13 @@ class SafePPOTrainer:
         
         # Load or create reference model (frozen)
         if ref_model is None:
-            # Create a copy of the initial model as reference
+            # Create a deep copy of the initial model as reference
             if isinstance(model, (str, os.PathLike)):
                 self.ref_model = SAFEDoubleHeadsModel.from_pretrained(model)
             else:
-                # Deep copy the model
-                self.ref_model = SAFEDoubleHeadsModel.from_pretrained(
-                    model.config._name_or_path if hasattr(model.config, '_name_or_path') else 'datamol-io/safe-gpt'
-                )
+                # Deep copy by state dict
+                import copy
+                self.ref_model = copy.deepcopy(self.model)
         elif isinstance(ref_model, (str, os.PathLike)):
             self.ref_model = SAFEDoubleHeadsModel.from_pretrained(ref_model)
         else:
@@ -141,8 +140,10 @@ class SafePPOTrainer:
         optimizer = torch.optim.Adam(self.model.parameters(), lr=config['lr'])
         
         # Ensure score_functions is a list
-        if not isinstance(score_functions, list):
+        if callable(score_functions):
             score_functions = [score_functions]
+        elif not isinstance(score_functions, list):
+            score_functions = list(score_functions)
             
         # Validate generation method
         valid_methods = [
@@ -276,6 +277,9 @@ class SafePPOTrainer:
                     sanitize=True,
                 )
             elif generation_method == 'linker_generation':
+                # linker_generation expects groups as a list/tuple
+                if not isinstance(item, (list, tuple)):
+                    item = [item]
                 generated = self.designer.linker_generation(
                     groups=item,
                     n_samples_per_trial=n_samples_per_trial,
@@ -347,7 +351,7 @@ class SafePPOTrainer:
         # Move to device
         input_ids = inputs['input_ids'].to(self.device)
         
-        # Remove EOS token from input for computing probabilities
+        # Prepare input sequence for next-token prediction by removing the last token
         input_ids = input_ids[:, :-1]
         
         # Get model outputs
@@ -442,8 +446,9 @@ class SafePPOTrainer:
             KL divergence
         """
         ref_log_probs = []
+        valid_indices = []
         
-        for mol in molecules:
+        for idx, mol in enumerate(molecules):
             try:
                 # Encode and tokenize
                 safe_str = sf.encode(mol, canonical=True)
@@ -473,15 +478,21 @@ class SafePPOTrainer:
                 ).squeeze(-1)
                 
                 ref_log_probs.append(ref_token_log_probs.sum())
+                valid_indices.append(idx)
             except Exception as e:
-                logger.debug(f"Failed to compute ref log prob: {e}")
-                # Use current log prob as fallback
-                ref_log_probs.append(log_probs[len(ref_log_probs)].detach())
+                logger.debug(f"Failed to compute ref log prob for molecule {idx}: {e}")
+                continue
                 
+        if not ref_log_probs:
+            # If all failed, return zero KL
+            return torch.tensor(0.0, device=self.device)
+            
         ref_log_probs = torch.stack(ref_log_probs)
+        # Only use log_probs for molecules that succeeded
+        valid_log_probs = log_probs[valid_indices]
         
         # KL(current || ref) = log_probs - ref_log_probs
-        kl_div = (log_probs - ref_log_probs).mean()
+        kl_div = (valid_log_probs - ref_log_probs).mean()
         
         return kl_div
         

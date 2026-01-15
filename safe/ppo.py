@@ -5,6 +5,7 @@ This module implements a Proximal Policy Optimization (PPO) trainer to guide
 different sampling methods defined in safe.sample.
 """
 
+import copy
 import os
 import random
 from typing import List, Optional, Union, Dict, Callable, Any
@@ -68,7 +69,6 @@ class SafePPOTrainer:
                 ref_model = SAFEDoubleHeadsModel.from_pretrained(model)
             else:
                 # Deep copy the model
-                import copy
                 ref_model = copy.deepcopy(self.model)
         elif isinstance(ref_model, (str, os.PathLike)):
             ref_model = SAFEDoubleHeadsModel.from_pretrained(ref_model)
@@ -176,7 +176,11 @@ class SafePPOTrainer:
             epoch_rewards = []
 
             # Sample batches from train_data
-            batch_indices = random.sample(range(len(train_data)), min(batch_size, len(train_data)))
+            # Use random.choices with replacement if batch_size > len(train_data)
+            if batch_size >= len(train_data):
+                batch_indices = random.choices(range(len(train_data)), k=batch_size)
+            else:
+                batch_indices = random.sample(range(len(train_data)), batch_size)
             batch_data = [train_data[i] for i in batch_indices]
 
             for data_item in tqdm(batch_data, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
@@ -299,9 +303,11 @@ class SafePPOTrainer:
             return [], torch.tensor([]), torch.tensor([])
 
         # Compute log probabilities for generated molecules
-        self.model.train()
         log_probs_list = []
         entropies_list = []
+
+        # Set model to training mode once before the loop
+        self.model.train()
 
         for mol_smiles in generated:
             try:
@@ -425,13 +431,13 @@ class SafePPOTrainer:
 
                     # Calculate KL divergence
                     current_log_probs = F.log_softmax(current_logits, dim=-1)
-                    ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+                    ref_probs = F.softmax(ref_logits, dim=-1)
 
                     kl_div = F.kl_div(
                         current_log_probs,
-                        ref_log_probs,
+                        ref_probs,
                         reduction='batchmean',
-                        log_target=True,
+                        log_target=False,
                     )
                     kl_divs.append(kl_div)
 
@@ -464,7 +470,7 @@ class SafePPOTrainer:
             PPO loss tensor
         """
         if log_probs.numel() == 0:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
+            return torch.zeros(1, device=self.device, requires_grad=True).squeeze()
 
         # Normalize rewards
         if len(rewards) > 1:

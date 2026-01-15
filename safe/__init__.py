@@ -5,3 +5,4 @@ from .sample import SAFEDesign
 from .tokenizer import SAFETokenizer, split
 from .viz import to_image
 from .io import upload_to_wandb
+from .ppo import SafePPO

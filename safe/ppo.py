@@ -6,6 +6,7 @@ different sampling methods defined in safe.sample to generate molecules with
 desired properties.
 """
 
+import copy
 import os
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 from pathlib import Path
@@ -72,7 +73,6 @@ class SafePPOTrainer:
                 self.ref_model = SAFEDoubleHeadsModel.from_pretrained(model)
             else:
                 # Deep copy by state dict
-                import copy
                 self.ref_model = copy.deepcopy(self.model)
         elif isinstance(ref_model, (str, os.PathLike)):
             self.ref_model = SAFEDoubleHeadsModel.from_pretrained(ref_model)
@@ -545,5 +545,5 @@ class SafePPOTrainer:
         logger.info(f"Model saved to {epoch_path}")
 
 
-# Alias for backward compatibility
+# Alias - SafePPO can be used interchangeably with SafePPOTrainer
 SafePPO = SafePPOTrainer

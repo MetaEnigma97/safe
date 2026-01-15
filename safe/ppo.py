@@ -3,6 +3,42 @@ Reinforcement Learning PPO Trainer for SAFE models.
 
 This module implements a Proximal Policy Optimization (PPO) trainer to guide
 different sampling methods defined in safe.sample.
+
+Example:
+    >>> import safe as sf
+    >>> from safe.ppo import SafePPOTrainer
+    >>>
+    >>> # Define a simple reward function (e.g., molecular weight penalty)
+    >>> def mw_reward(smiles):
+    ...     mol = dm.to_mol(smiles)
+    ...     if mol is None:
+    ...         return 0.0
+    ...     mw = dm.descriptors.mw(mol)
+    ...     # Reward molecules with MW between 300-500
+    ...     if 300 <= mw <= 500:
+    ...         return 1.0
+    ...     else:
+    ...         return -abs(mw - 400) / 400
+    >>>
+    >>> # Initialize trainer
+    >>> trainer = SafePPOTrainer(
+    ...     model="path/to/safe/model",
+    ...     tokenizer="path/to/tokenizer",
+    ... )
+    >>>
+    >>> # Define training data (scaffolds for scaffold decoration)
+    >>> train_data = ["c1ccccc1", "C1CCCCC1", "c1ccncc1"]
+    >>>
+    >>> # Train the model
+    >>> trainer.train(
+    ...     train_data=train_data,
+    ...     generation_method="scaffold_decoration",
+    ...     score_functions=[mw_reward],
+    ...     model_save_path="./ppo_trained_model",
+    ...     epochs=50,
+    ...     batch_size=16,
+    ...     ppo_config={"lr": 1e-5, "kl_coef": 0.1},
+    ... )
 """
 
 import copy
@@ -28,6 +64,24 @@ class SafePPOTrainer:
 
     This trainer uses Proximal Policy Optimization to fine-tune a SAFE model
     based on reward functions, supporting various generation strategies.
+
+    The trainer maintains two models:
+    - A trainable policy model that is updated during training
+    - A frozen reference model used to compute KL divergence penalty
+
+    Supported generation methods:
+    - de_novo_generation: Generate molecules from scratch
+    - motif_extension: Extend molecular motifs
+    - linker_generation: Generate linkers between two fragments
+    - scaffold_decoration: Decorate molecular scaffolds
+    - super_structure: Generate super structures from molecular cores
+
+    Attributes:
+        model: The trainable SAFE model
+        tokenizer: The SAFE tokenizer
+        ref_model: The frozen reference model for KL penalty
+        device: Device for computation (cuda/cpu)
+        designer: SAFEDesign instance for molecule generation
     """
 
     def __init__(
@@ -46,7 +100,8 @@ class SafePPOTrainer:
             ref_model: Reference model for KL penalty (or path to it). If None, uses a copy of the model.
             device: Device to use for training ('cuda' or 'cpu')
         """
-        # Load model
+        # Load model and store the original path if provided
+        model_path = model if isinstance(model, (str, os.PathLike)) else None
         if isinstance(model, (str, os.PathLike)):
             model = SAFEDoubleHeadsModel.from_pretrained(model)
         self.model = model
@@ -65,8 +120,8 @@ class SafePPOTrainer:
         # Load or create reference model for KL penalty
         if ref_model is None:
             # Create a copy of the model as reference
-            if isinstance(model, (str, os.PathLike)):
-                ref_model = SAFEDoubleHeadsModel.from_pretrained(model)
+            if model_path is not None:
+                ref_model = SAFEDoubleHeadsModel.from_pretrained(model_path)
             else:
                 # Deep copy the model
                 ref_model = copy.deepcopy(self.model)
@@ -420,26 +475,26 @@ class SafePPOTrainer:
                     max_length=1024,
                 ).to(self.device)
 
-                # Get current model logits
-                with torch.no_grad():
-                    current_outputs = self.model(**inputs)
-                    current_logits = current_outputs.logits
+                # Get current model logits (with gradients for backprop)
+                current_outputs = self.model(**inputs)
+                current_logits = current_outputs.logits
 
-                    # Get reference model logits
+                # Get reference model logits (no gradients needed)
+                with torch.no_grad():
                     ref_outputs = self.ref_model(**inputs)
                     ref_logits = ref_outputs.logits
 
-                    # Calculate KL divergence
-                    current_log_probs = F.log_softmax(current_logits, dim=-1)
-                    ref_probs = F.softmax(ref_logits, dim=-1)
+                # Calculate KL divergence
+                current_log_probs = F.log_softmax(current_logits, dim=-1)
+                ref_probs = F.softmax(ref_logits, dim=-1)
 
-                    kl_div = F.kl_div(
-                        current_log_probs,
-                        ref_probs,
-                        reduction='batchmean',
-                        log_target=False,
-                    )
-                    kl_divs.append(kl_div)
+                kl_div = F.kl_div(
+                    current_log_probs,
+                    ref_probs,
+                    reduction='batchmean',
+                    log_target=False,
+                )
+                kl_divs.append(kl_div)
 
             except Exception as e:
                 logger.warning(f"Failed to compute KL divergence for {mol_smiles}: {e}")
@@ -470,7 +525,8 @@ class SafePPOTrainer:
             PPO loss tensor
         """
         if log_probs.numel() == 0:
-            return torch.zeros(1, device=self.device, requires_grad=True).squeeze()
+            # Return a scalar tensor that participates in the computational graph
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         # Normalize rewards
         if len(rewards) > 1:

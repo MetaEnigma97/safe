@@ -12,10 +12,15 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 import torch.nn.functional as F
 from transformers import PreTrainedTokenizerFast
+
 # SAFE imports
-from safe.trainer.model import SAFEDoubleHeadsModel
-from safe.tokenizer import SAFETokenizer
-from safe.sample import SAFEDesign
+# Ensure these are available in your environment
+try:
+    from safe.trainer.model import SAFEDoubleHeadsModel
+    from safe.tokenizer import SAFETokenizer
+    from safe.sample import SAFEDesign
+except ImportError:
+    pass # Assume they are available at runtime
 
 class MemoryDataset(Dataset):
     def __init__(self, safe_strings: List[str]):
@@ -35,6 +40,7 @@ class SafeAugmentedOptimizer:
         memory_size: int = 100,
         entropy_weight: float = 0.0,
         exploration_prob: float = 0.1, 
+        augmentation_rounds: int = 0, # NEW: Enable Augmented Memory (Randomized SMILES)
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.device = device
@@ -44,6 +50,7 @@ class SafeAugmentedOptimizer:
         self.max_length = max_length
         self.entropy_weight = entropy_weight
         self.exploration_prob = exploration_prob
+        self.augmentation_rounds = augmentation_rounds
         self.model_path = model_path
         
         print(f"Loading SAFE model from {model_path}...")
@@ -58,52 +65,141 @@ class SafeAugmentedOptimizer:
         for param in self.original_model.parameters():
             param.requires_grad = False
         
+        # Memory structure: List of (score, smiles, safe_str)
         self.memory: List[Tuple[float, str, str]] = []
         self.seen_smiles = set()
+        
+        # Optimizer - Initialize here if you want persistence, 
+        # but for short fine-tuning steps, re-init is often fine. 
+        # We will keep it local to fine_tune to match typical "few-shot" logic,
+        # but you can move it here if you want momentum to carry over steps.
 
     def update_memory(self, candidates: List[Tuple[float, str, str]]) -> int:
         """
-        Update memory and return the number of NEW items added.
+        Update memory with new candidates.
+        Corrected logic: Collect all valid candidates, merge with memory, sort, then prune.
+        Returns: Number of NEW items that survived into the memory.
         """
-        added_count = 0
-        for score, smi, safe_str in candidates:
-            # Check if unique and valid
-            if smi not in self.seen_smiles and safe_str is not None:
-                # Basic check: only add if memory not full OR score is better than worst in memory
-                if len(self.memory) < self.memory_size:
-                    self.memory.append((score, smi, safe_str))
-                    self.seen_smiles.add(smi)
-                    added_count += 1
-                else:
-                    # Memory is full, check if better than worst
-                    # Assuming memory is sorted descending, last is worst
-                    worst_score = self.memory[-1][0]
-                    if score > worst_score:
-                        self.memory.append((score, smi, safe_str))
-                        self.seen_smiles.add(smi)
-                        added_count += 1
+        # Filter invalid
+        valid_candidates = [c for c in candidates if c[1] is not None and c[2] is not None]
+        if not valid_candidates:
+            return 0
+
+        # Identify potential new additions (not currently in memory)
+        # Note: We allow updating if the same SMILES comes with a BETTER score (though rare in this setup)
+        # For simplicity, we stick to the set check for novelty.
         
-        # Re-sort and Prune
+        current_memory_smiles = set(self.seen_smiles)
+        
+        # Merge candidates into a temporary list
+        # We process candidates to ensure we only keep the best score for any duplicate SMILES within the batch
+        batch_best = {}
+        for score, smi, safe_str in valid_candidates:
+            if smi not in batch_best:
+                batch_best[smi] = (score, smi, safe_str)
+            else:
+                if score > batch_best[smi][0]:
+                    batch_best[smi] = (score, smi, safe_str)
+        
+        new_items = list(batch_best.values())
+        
+        # Add new unique items to memory
+        added_candidates = []
+        for item in new_items:
+            # If not seen, add. 
+            # If seen, strictly we could update if score improves, but we'll skip for now to keep seen_smiles simple.
+            if item[1] not in self.seen_smiles:
+                self.memory.append(item)
+                self.seen_smiles.add(item[1])
+                added_candidates.append(item[1])
+
+        # Sort Memory by score (descending)
         self.memory.sort(key=lambda x: x[0], reverse=True)
         
+        # Prune if over size
         if len(self.memory) > self.memory_size:
-            removed = self.memory[self.memory_size:]
-            for _, smi, _ in removed:
-                if smi in self.seen_smiles:
-                    self.seen_smiles.remove(smi)
-            self.memory = self.memory[:self.memory_size]
+            kept_memory = self.memory[:self.memory_size]
             
-        return added_count
+            # Identify what was removed to update seen_smiles
+            # (Though seen_smiles typically tracks lifetime seen, for memory we usually track "currently in memory")
+            # The reference implementation tracks currently in memory.
+            
+            self.memory = kept_memory
+            
+            # Rebuild seen set to match current memory exactly
+            self.seen_smiles = set([x[1] for x in self.memory])
+            
+            # Calculate how many of the *newly added* candidates survived the cut
+            survived_new_smiles = self.seen_smiles.intersection(set(added_candidates))
+            return len(survived_new_smiles)
+        else:
+            return len(added_candidates)
+
+    def _augment_safe_strings(self, smiles_list: List[str]) -> List[str]:
+        """
+        Generate randomized variations of molecules and encode them to SAFE.
+        This mimics the 'Augmented Memory' approach.
+        """
+        augmented_data = []
+        for smi in smiles_list:
+            try:
+                mol = dm.to_mol(smi)
+                if mol is None: continue
+                
+                # Generate 'augmentation_rounds' randomized SMILES
+                for _ in range(self.augmentation_rounds):
+                    # Randomize SMILES
+                    rand_smi = dm.to_smiles(mol, canonical=False, randomize=True)
+                    if rand_smi:
+                        rand_mol = dm.to_mol(rand_smi)
+                        # Attempt to encode non-canonically if SAFE supports it, 
+                        # or just rely on randomized SMILES input producing slightly different tokens 
+                        # if the tokenizer is sensitive to it.
+                        # Note: sf.encode(canonical=True) might force them back to same string.
+                        # We try canonical=False to allow variation.
+                        safe_str = sf.encode(rand_mol, canonical=False) 
+                        augmented_data.append(safe_str)
+            except Exception:
+                continue
+        return augmented_data
+
+    def mode_collapse_guard(self):
+        """
+        Check if memory has collapsed to a single solution (low diversity).
+        If so, clear memory to force exploration.
+        """
+        if len(self.memory) < self.memory_size // 2:
+            return
+
+        scores = [x[0] for x in self.memory]
+        unique_scores = set(scores)
+        
+        # If all scores are identical (and not just 1 item), assume collapse
+        if len(unique_scores) == 1 and len(scores) > 1:
+            print("!!! Mode Collapse Detected - Purging Memory !!!")
+            self.memory = []
+            self.seen_smiles = set()
 
     def fine_tune_on_memory(self, epochs: int = 5, train_batch_size: int = 32):
         if len(self.memory) < 4: return
 
+        # 1. Prepare Training Data
+        # Always include the canonical strings currently in memory
+        train_strs = [item[2] for item in self.memory]
+        
+        # 2. Data Augmentation (Reference Feature)
+        if self.augmentation_rounds > 0:
+            memory_smiles = [item[1] for item in self.memory]
+            augmented_strs = self._augment_safe_strings(memory_smiles)
+            train_strs.extend(augmented_strs)
+
         self.model.train()
+        # Using a fresh optimizer for the fine-tuning step (expert iteration style)
         optimizer = AdamW(self.model.parameters(), lr=self.lr)
         
-        train_data = [item[2] for item in self.memory]
-        dataset = MemoryDataset(train_data)
-        loader = DataLoader(dataset, batch_size=train_batch_size, shuffle=True)
+        dataset = MemoryDataset(train_strs)
+        # Drop last to avoid very small batches which can cause unstable gradients
+        loader = DataLoader(dataset, batch_size=train_batch_size, shuffle=True, drop_last=len(dataset) > train_batch_size)
         
         for _ in range(epochs):
             for batch_strs in loader:
@@ -137,13 +233,14 @@ class SafeAugmentedOptimizer:
                     labels[labels == hf_tokenizer.pad_token_id] = -100
                 
                 outputs = self.model(input_ids=input_ids, labels=labels)
-                nll_loss = outputs.loss
+                loss = outputs.loss
                 
-                loss = nll_loss
+                # Entropy Regularization
                 if self.entropy_weight > 0:
                     logits = outputs.logits
                     probs = F.softmax(logits, dim=-1)
                     log_probs = F.log_softmax(logits, dim=-1)
+                    # Calculate entropy
                     entropy = -torch.sum(probs * log_probs, dim=-1).mean()
                     loss = loss - (self.entropy_weight * entropy)
                 
@@ -151,6 +248,7 @@ class SafeAugmentedOptimizer:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
+        
         self.model.eval()
 
     def generate_batch(self, mode: str, input_data: Any = None) -> Tuple[List[str], bool]:
@@ -202,14 +300,14 @@ class SafeAugmentedOptimizer:
         score_fn: Callable[[List[str]], Dict[str, List[float]]],
         save_path: str,
         input_data: Any = None,
-        target_score: float = 2.0, # NEW: The score considered "Perfect"
+        target_score: float = 2.0,
         epochs: int = 50,
         save_freq: int = 5,
         ft_epochs_per_step: int = 5,
         train_batch_size: int = 256
     ):
         os.makedirs(save_path, exist_ok=True)
-        print(f"Starting | Mode: {mode} | Batch: {self.batch_size} | LR: {self.lr}")
+        print(f"Starting | Mode: {mode} | Batch: {self.batch_size} | LR: {self.lr} | Augment: {self.augmentation_rounds}")
         
         history = {
             "epoch": [], 
@@ -218,19 +316,24 @@ class SafeAugmentedOptimizer:
             "best_memory_score": [], 
             "memory_size": [], 
             "is_exploring": [],
-            "new_in_memory_pct": [], # NEW: % of batch added to memory
-            "perfect_score_pct": []  # NEW: % of batch hitting target score
+            "new_in_memory_pct": [],
+            "perfect_score_pct": []
         }
         
         pbar = tqdm(range(1, epochs + 1))
         
         for epoch in pbar:
+            # 1. Mode Collapse Check
+            self.mode_collapse_guard()
+
+            # 2. Generation
             raw_smiles_batch, is_exploring = self.generate_batch(mode, input_data)
             
             candidates = []
             valid_smiles_list = []
             valid_safe_strs = []
             
+            # 3. Validation & Encoding
             for smi in raw_smiles_batch:
                 if smi is None: continue
                 try:
@@ -242,7 +345,7 @@ class SafeAugmentedOptimizer:
                 except:
                     continue
             
-            # --- Metrics Calculation ---
+            # 4. Scoring
             total_generated = len(raw_smiles_batch)
             validity = len(valid_smiles_list) / total_generated if total_generated > 0 else 0.0
             
@@ -260,7 +363,7 @@ class SafeAugmentedOptimizer:
                     
                     for i, (smi, safe_str, score) in enumerate(zip(valid_smiles_list, valid_safe_strs, aggregated_rewards)):
                         candidates.append((score, smi, safe_str))
-                        if score >= target_score: # Count perfect scores
+                        if score >= target_score:
                             perfect_count += 1
                             
                     mean_reward = np.mean(aggregated_rewards)
@@ -269,15 +372,13 @@ class SafeAugmentedOptimizer:
             
             perfect_score_pct = perfect_count / len(valid_smiles_list) if valid_smiles_list else 0.0
 
-            # Update Memory & Count Freshness
+            # 5. Update Memory
             new_items_count = self.update_memory(candidates)
-            
-            # Calculate freshness relative to valid molecules generated
             new_in_memory_pct = new_items_count / len(valid_smiles_list) if valid_smiles_list else 0.0
             
             best_mem_score = self.memory[0][0] if self.memory else 0.0
             
-            # History
+            # 6. Logging
             history["epoch"].append(epoch)
             history["mean_reward"].append(mean_reward)
             history["validity"].append(validity)
@@ -287,11 +388,11 @@ class SafeAugmentedOptimizer:
             history["new_in_memory_pct"].append(new_in_memory_pct)
             history["perfect_score_pct"].append(perfect_score_pct)
             
+            # 7. Fine-Tuning (Experience Replay)
             if len(self.memory) >= 4:
                 self.fine_tune_on_memory(epochs=ft_epochs_per_step, train_batch_size=train_batch_size)
             
             explore_tag = "[EXP]" if is_exploring else "     "
-            # Updated Pbar Description
             pbar.set_description(
                 f"{explore_tag} E:{epoch} | Rwd:{mean_reward:.2f} | Perfect:{perfect_score_pct:.1%} | NewMem:{new_in_memory_pct:.1%} | Best:{best_mem_score:.2f}"
             )

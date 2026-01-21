@@ -20,7 +20,7 @@ from safe.tokenizer import SAFETokenizer
 from safe.sample import SAFEDesign
 
 class DiversityFilter:
-    def __init__(self, bucket_size: int = 500): # Increased default bucket size
+    def __init__(self, bucket_size: int = 500):
         self.bucket_size = bucket_size
         self.scaffold_counter = defaultdict(int)
         self.seen_smiles = set() 
@@ -30,25 +30,27 @@ class DiversityFilter:
         self.seen_smiles.clear()
 
     def calculate_penalty(self, smiles: str) -> Tuple[float, bool]:
-        # 1. Uniqueness check
         if smiles in self.seen_smiles:
             is_new = False
+            # 重复分子不给分，防止刷分
+            # 如果你发现模型探索能力实在太差，可以改为 return 0.5, is_new
             pass 
         else:
             is_new = True
             self.seen_smiles.add(smiles)
 
-        # 2. Scaffold calculation
         scaffold = "generic"
-        mol = Chem.MolFromSmiles(smiles)
-        if mol:
-            scaffold_mol = MurckoScaffold.GetScaffoldForMol(mol)
-            if scaffold_mol:
-                scaffold = Chem.MolToSmiles(scaffold_mol)
-        # 3. Bucket check
+        try:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol:
+                scaffold_mol = MurckoScaffold.GetScaffoldForMol(mol)
+                if scaffold_mol:
+                    scaffold = Chem.MolToSmiles(scaffold_mol)
+        except:
+            pass
+        
         self.scaffold_counter[scaffold] += 1
         
-        # If bucket is full, penalty is 0.0
         if self.scaffold_counter[scaffold] > self.bucket_size:
             return 0.0, is_new
             
@@ -59,11 +61,11 @@ class SafeReinventOptimizer:
     def __init__(
         self,
         model_path: str,
-        lr: float = 1e-5,
+        lr: float = 1e-6, # 降低 LR 防止崩塌
         batch_size: int = 1024,
         max_length: int = 80,
-        sigma: float = 60.0,
-        bucket_size: int = 500, # Increased
+        sigma: float = 10.0, # 使用你尝试的较小 Sigma
+        bucket_size: int = 500,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.device = device
@@ -91,24 +93,42 @@ class SafeReinventOptimizer:
 
     def _get_log_probs(self, model, input_ids, attention_mask):
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits 
+        logits = outputs.logits # (Batch, Seq, Vocab)
         
+        # Shift logits and input_ids for autoregressive loss
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous()
         
         log_probs = F.log_softmax(shift_logits, dim=-1)
+        
+        # Gather the log prob of the actual target token
         target_log_probs = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+        
+        # Apply mask (ignore padding)
         shift_mask = attention_mask[..., 1:].contiguous()
+        
+        # Sum log probs over the sequence
         seq_log_probs = (target_log_probs * shift_mask).sum(dim=1)
         
-        return seq_log_probs
+        # === NEW: Length Normalization ===
+        # Calculate actual length of each sequence (sum of mask)
+        seq_lengths = shift_mask.sum(dim=1)
+        # Avoid division by zero
+        seq_lengths = torch.clamp(seq_lengths, min=1.0)
+        
+        normalized_log_probs = seq_log_probs / seq_lengths
+        
+        return normalized_log_probs
 
     def train_step(self, smiles_list: List[str], rewards: List[float]):
-        if not smiles_list: return 0.0
+        """
+        Modified train_step with Mini-Batching and Stability Checks
+        """
+        if not smiles_list: return 0.0, 0.0, 0.0
             
+        # 1. Encode
         safe_strings = []
         valid_indices = []
-        
         for i, smi in enumerate(smiles_list):
             try:
                 mol = dm.to_mol(smi)
@@ -118,19 +138,17 @@ class SafeReinventOptimizer:
                         if encoded_str:
                             safe_strings.append(encoded_str)
                             valid_indices.append(i)
-                    except Exception:
-                        continue
-            except Exception:
-                continue
+                    except: continue
+            except: continue
         
-        if not safe_strings: return 0.0
+        if not safe_strings: return 0.0, 0.0, 0.0
             
-        valid_rewards = torch.tensor(
+        all_rewards = torch.tensor(
             [float(rewards[i]) for i in valid_indices], 
-            device=self.device,
-            dtype=torch.float32
+            device=self.device, dtype=torch.float32
         )
         
+        # 2. Tokenizer Setup
         if hasattr(self.tokenizer, "tokenizer"):
              hf_tokenizer = PreTrainedTokenizerFast(tokenizer_object=self.tokenizer.tokenizer)
              if hasattr(self.tokenizer, "pad_token"): hf_tokenizer.pad_token = self.tokenizer.pad_token
@@ -145,36 +163,63 @@ class SafeReinventOptimizer:
             else:
                 hf_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
-        inputs = hf_tokenizer(
-            safe_strings,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            add_special_tokens=True
-        )
+        # 3. Mini-Batch Training Loop
+        batch_size = 32 # Small training batch size for stability
+        total_samples = len(safe_strings)
+        num_batches = (total_samples + batch_size - 1) // batch_size
         
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
+        total_loss = 0.0
+        total_agent_logp = 0.0
+        total_prior_logp = 0.0
         
-        agent_log_probs = self._get_log_probs(self.agent_model, input_ids, attention_mask)
-        with torch.no_grad():
-            prior_log_probs = self._get_log_probs(self.prior_model, input_ids, attention_mask)
+        # Shuffle
+        indices = list(range(total_samples))
+        random.shuffle(indices)
+        
+        for i in range(num_batches):
+            batch_indices = indices[i * batch_size : (i + 1) * batch_size]
+            batch_strs = [safe_strings[k] for k in batch_indices]
+            batch_rewards = all_rewards[batch_indices]
             
-        score_term = self.sigma * valid_rewards
-        loss = (agent_log_probs - prior_log_probs - score_term).pow(2).mean()
-        
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.agent_model.parameters(), 1.0)
-        self.optimizer.step()
-        
-        loss_val = loss.item()
-        
-        del inputs, input_ids, attention_mask, agent_log_probs, prior_log_probs, loss, score_term, valid_rewards
-        torch.cuda.empty_cache() 
-        
-        return loss_val
+            inputs = hf_tokenizer(
+                batch_strs,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                add_special_tokens=True
+            )
+            
+            input_ids = inputs["input_ids"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
+            
+            # Forward Pass
+            agent_log_probs = self._get_log_probs(self.agent_model, input_ids, attention_mask)
+            
+            with torch.no_grad():
+                prior_log_probs = self._get_log_probs(self.prior_model, input_ids, attention_mask)
+            
+            score_term = self.sigma * batch_rewards
+            
+            # Loss Calculation
+            # Loss = (logP_A - logP_P - sigma * R)^2
+            loss = (agent_log_probs - prior_log_probs - score_term).pow(2).mean()
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.agent_model.parameters(), 1.0)
+            self.optimizer.step()
+            
+            # Accumulate Stats
+            total_loss += loss.item()
+            total_agent_logp += agent_log_probs.mean().item()
+            total_prior_logp += prior_log_probs.mean().item()
+            
+            # Cleanup
+            del inputs, input_ids, attention_mask, agent_log_probs, prior_log_probs, loss, score_term
+            torch.cuda.empty_cache()
+            
+        return (total_loss / num_batches), (total_agent_logp / num_batches), (total_prior_logp / num_batches)
 
     def generate_batch(self, mode: str, input_data: Any = None) -> List[str]:
         micro_batch = 64
@@ -236,13 +281,14 @@ class SafeReinventOptimizer:
         save_freq: int = 5
     ):
         os.makedirs(save_path, exist_ok=True)
-        print(f"Starting REINVENT Optimization | Mode: {mode} | Batch: {self.batch_size}")
+        print(f"Starting REINVENT Optimization | Mode: {mode} | Batch: {self.batch_size} | LR: {self.lr} | Sigma: {self.sigma}")
         
         self.diversity_filter.reset()
         
         history = {
             "epoch": [], "mean_score": [], "mean_loss": [], "validity": [], 
-            "new_molecules_pct": [], "perfect_score_pct": []
+            "new_molecules_pct": [], "perfect_score_pct": [], 
+            "agent_logp": [], "prior_logp": []
         }
         
         pbar = tqdm(range(1, epochs + 1))
@@ -250,12 +296,6 @@ class SafeReinventOptimizer:
         for epoch in pbar:
             # 1. Generate
             raw_smiles = self.generate_batch(mode, input_data)
-            
-            # Debug: Check generation diversity
-            if raw_smiles:
-                unique_gen = len(set(raw_smiles))
-                if unique_gen < 5:
-                    print(f"\nWARNING: Mode Collapse? Only {unique_gen} unique SMILES in batch of {len(raw_smiles)}")
             
             # 2. Validate
             valid_smiles = []
@@ -271,26 +311,27 @@ class SafeReinventOptimizer:
             perfect_count = 0
             
             if valid_smiles:
-                scores_dict = score_fn(valid_smiles)
-                
-                raw_scores = np.zeros(len(valid_smiles))
-                for k, v in scores_dict.items():
-                    if len(v) == len(valid_smiles):
-                        raw_scores += np.array(v)
-                
-                for i, smi in enumerate(valid_smiles):
-                    penalty, is_new = self.diversity_filter.calculate_penalty(smi)
+                try:
+                    scores_dict = score_fn(valid_smiles)
+                    raw_scores = np.zeros(len(valid_smiles))
+                    for k, v in scores_dict.items():
+                        if len(v) == len(valid_smiles):
+                            raw_scores += np.array(v)
                     
-                    if is_new: new_count += 1
-                    
-                    final_s = raw_scores[i] * penalty
-                    if raw_scores[i] >= target_score: perfect_count += 1
-                    
-                    final_smiles.append(smi)
-                    total_rewards.append(final_s)
+                    for i, smi in enumerate(valid_smiles):
+                        penalty, is_new = self.diversity_filter.calculate_penalty(smi)
+                        if is_new: new_count += 1
+                        
+                        final_s = raw_scores[i] * penalty
+                        if raw_scores[i] >= target_score: perfect_count += 1
+                        
+                        final_smiles.append(smi)
+                        total_rewards.append(final_s)
+                except Exception as e:
+                    print(f"Score Error: {e}")
                         
             # 3. Train
-            loss = self.train_step(final_smiles, total_rewards)
+            loss, avg_agent_logp, avg_prior_logp = self.train_step(final_smiles, total_rewards)
             
             # 4. Stats
             mean_rwd = np.mean(total_rewards) if total_rewards else 0.0
@@ -303,9 +344,12 @@ class SafeReinventOptimizer:
             history["validity"].append(validity)
             history["new_molecules_pct"].append(new_pct)
             history["perfect_score_pct"].append(perfect_pct)
+            history["agent_logp"].append(avg_agent_logp)
+            history["prior_logp"].append(avg_prior_logp)
             
+            # 打印 LogP 信息以供监控
             pbar.set_description(
-                f"Rwd: {mean_rwd:.2f} | Loss: {loss:.2f} | Val: {validity:.0%} | New: {new_pct:.0%} | Perf: {perfect_pct:.0%}"
+                f"Rwd: {mean_rwd:.2f} | Loss: {loss:.1f} | AgtLogP: {avg_agent_logp:.1f} | PriLogP: {avg_prior_logp:.1f}"
             )
             
             if epoch % save_freq == 0:

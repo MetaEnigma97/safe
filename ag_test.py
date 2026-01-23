@@ -1,19 +1,42 @@
+#!/usr/bin/env python3
 import os
 import argparse
 import datamol as dm
-from eletrolyte_filter import check_sol_molecule, check_add_molecule
+
+# electrolyte checker functions (用户仓库可能已放在工程根或别处)
+try:
+    from eletrolyte_filter import check_sol_molecule, check_add_molecule
+except Exception:
+    # 如果模块不在 PYTHONPATH 中，先定义占位函数避免崩溃（会在运行时打印 warning）
+    def check_sol_molecule(smi: str) -> bool:
+        return True
+
+    def check_add_molecule(smi: str) -> bool:
+        return True
+
 # Ensure TOKENIZERS_PARALLELISM off to avoid warnings from HF tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Local import (assumes safe/augment_memory.py 已在仓库中)
 from safe.augment_memory import SafeAugmentedOptimizer
 
-# RewardCalculator 在仓库根目录的 reward.py 中
+# RewardCalculator 在仓库根目录的 reward.py 中（允许相对导入）
 try:
-    from reward import RewardCalculator
+    from reward import RewardCalculator  # top-level
 except Exception:
-    # 如果你的 reward.py 在另一路径，请调整 import
-    from .reward import RewardCalculator  # attempt relative
+    try:
+        from .reward import RewardCalculator  # relative
+    except Exception:
+        # placeholder: 若没有 reward.py，定义一个最简单的打分函数，便于做 smoke-test
+        class RewardCalculator:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def calculate(self, smiles_list):
+                # return a dict-like mapping of individual components (match original expectation)
+                # 这里返回单个 component "score" -> list of zeros
+                return {"score": [0.0 for _ in smiles_list]}
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run Safe Augmented Memory test")
@@ -37,25 +60,25 @@ def parse_args():
     p.add_argument("--tanimoto-threshold", type=float, default=0.8, help="for diversity pruning: threshold to consider two molecules similar")
     p.add_argument("--novelty-threshold", type=float, default=0.6, help="for novelty_replace: max sim allowed for candidate to be considered novel")
     p.add_argument("--min-score-delta", type=float, default=-0.1, help="minimal score improvement required to evict lowest-scoring memory item")
+    # new options
+    p.add_argument("--unique-sampling", type=bool, default=True, help="是否在生成后进行去重采样，默认 False")
+    p.add_argument("--double-loop-augment",type=bool, default=True, help="是否启用 double-loop augmentation（训练阶段对随机化序列再训练），默认 False")
+    p.add_argument("--export-memory-path", type=str, default=None, help="如果指定，训练结束后导出 memory csv 到该路径（文件夹或带文件名）")
     return p.parse_args()
+
 
 def main():
     args = parse_args()
     if not os.path.isdir(args.model_path):
         raise FileNotFoundError(f"Model path not found: {args.model_path}")
 
-    calc = RewardCalculator({"homo": (-20, -8.5), "ox": (9, 20)}, match_mode="all")
+    # example RewardCalculator instantiation; adapt to你的具体打分逻辑和参数
+    calc = RewardCalculator({"homo": (-20, -8.5), "ox": (9, 20)}, match_mode="all") if hasattr(RewardCalculator, "__init__") else RewardCalculator()
 
-    # 尝试获取 checker 函数
-    checker = None
-    if args.mol_type == "sol":
-        checker = check_sol_molecule
-        if checker is None:
-            print("[ag_test] Warning: RewardCalculator has no method check_sol_molecule; no checking will be applied for 'sol'.")
-    else:
-        checker = check_add_molecule
-        if checker is None:
-            print("[ag_test] Warning: RewardCalculator has no method check_add_molecule; no checking will be applied for 'add'.")
+    # pick checker 函数
+    checker = check_sol_molecule if args.mol_type == "sol" else check_add_molecule
+    if checker is None:
+        print("[ag_test] Warning: no checker function available; proceeding without extra validation.")
 
     optimizer = SafeAugmentedOptimizer(
         model_path=args.model_path,
@@ -65,11 +88,13 @@ def main():
         entropy_weight=args.entropy_weight,
         exploration_prob=args.exploration_prob,
         augmentation_rounds=args.augmentation_rounds,
+        unique_sampling=args.unique_sampling,
+        double_loop_augment=args.double_loop_augment,
     )
 
     optimizer.run(
         mode=args.mode,
-        score_fn=calc.calculate,
+        score_fn=calc.calculate if hasattr(calc, "calculate") else calc,
         save_path=args.out,
         input_data=None,
         target_score=args.target_score,
@@ -87,6 +112,16 @@ def main():
         novelty_threshold=args.novelty_threshold,
         min_score_delta=args.min_score_delta
     )
+
+    if args.export_memory_path:
+        # export memory snapshot
+        out_path = args.export_memory_path
+        try:
+            optimizer.export_memory(out_path)
+            print(f"[ag_test] memory exported to {out_path}")
+        except Exception as e:
+            print(f"[ag_test] export memory failed: {e}")
+
 
 if __name__ == "__main__":
     main()

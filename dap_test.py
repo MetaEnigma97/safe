@@ -12,14 +12,14 @@ calc = RewardCalculator(
 
 # Initialize Optimizer
 optimizer = SafeReinventOptimizer(
-    model_path="/AI4S/Users/jwli/safe_gpt/models/model_sol_withoutB/checkpoint-1924776",
-    lr=2e-6,
+    model_path="/AI4S/Users/jwli/safe_gpt/models/model_add_with1B/checkpoint-7309428",
+    lr=1e-4,
     batch_size=1024,
     max_length=80,
     sigma=5.0,
     bucket_size=5000,
     memory_size=200,
-    penalty_factor=0.5 
+    penalty_factor=0.3 
 )
 
 # Run Optimization

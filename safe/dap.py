@@ -30,7 +30,17 @@ class Inception:
 
     def add(self, safe_strings: List[str], scores: List[float], prior_log_probs: List[float]):
         for s, sc, plp in zip(safe_strings, scores, prior_log_probs):
-            self.memory.append((s, sc, plp))
+            # Only add high quality samples to memory
+            if sc > 0.8: 
+                self.memory.append((s, sc, plp))
+        
+        # Keep only unique SMILES in memory to maintain diversity
+        unique_mem = {}
+        for s, sc, plp in self.memory:
+            if s not in unique_mem or sc > unique_mem[s][0]:
+                unique_mem[s] = (sc, plp)
+        
+        self.memory = [(s, sc, plp) for s, (sc, plp) in unique_mem.items()]
         self.memory.sort(key=lambda x: x[1], reverse=True)
         self.memory = self.memory[:self.memory_size]
 

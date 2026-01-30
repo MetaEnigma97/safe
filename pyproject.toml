@@ -76,7 +76,7 @@ zip-safe = false
 license-files = ["LICENSE"]
 
 [tool.setuptools_scm]
-fallback_version = "dev"
+fallback_version = "0.0.0.dev0"
 
 [tool.setuptools.packages.find]
 where = ["."]
